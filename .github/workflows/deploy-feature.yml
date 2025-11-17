@@ -1,0 +1,219 @@
+name: Deploy Feature Branch to ECS
+
+on:
+  push:
+    branches:
+      - 'feature-*'
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: fastapi-app
+  ECS_CLUSTER: fastapi-cluster
+  ECS_SERVICE_PREFIX: fastapi-feature
+  CONTAINER_NAME: fastapi-container
+  TASK_DEFINITION_FAMILY: fastapi-task-definition
+  PROJECT_NAME: fastapi-ecs
+
+jobs:
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Extract branch name
+      id: extract_branch
+      run: |
+        BRANCH_NAME=${GITHUB_REF#refs/heads/}
+        # Replace slashes and special chars with hyphens for service name
+        SAFE_BRANCH_NAME=$(echo $BRANCH_NAME | sed 's/[^a-zA-Z0-9-]/-/g' | tr '[:upper:]' '[:lower:]')
+        echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+        echo "safe_branch_name=$SAFE_BRANCH_NAME" >> $GITHUB_OUTPUT
+        echo "service_name=${{ env.ECS_SERVICE_PREFIX }}-$SAFE_BRANCH_NAME" >> $GITHUB_OUTPUT
+        echo "tg_name=tg-$SAFE_BRANCH_NAME" >> $GITHUB_OUTPUT
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ steps.extract_branch.outputs.safe_branch_name }}-${{ github.sha }}
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.extract_branch.outputs.safe_branch_name }}-latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ steps.extract_branch.outputs.safe_branch_name }}-latest
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Check if ECS service exists
+      id: check-service
+      run: |
+        SERVICE_NAME=${{ steps.extract_branch.outputs.service_name }}
+        if aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services $SERVICE_NAME --region ${{ env.AWS_REGION }} 2>/dev/null | jq -e '.services[0].status == "ACTIVE"' >/dev/null 2>&1; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Get base task definition
+      id: get-task-def
+      run: |
+        # Get the latest task definition from the family
+        LATEST_TASK_DEF=$(aws ecs describe-task-definition \
+          --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
+          --region ${{ env.AWS_REGION }} \
+          --query 'taskDefinition' \
+          --output json)
+
+        # Extract necessary fields and create new task definition
+        echo "$LATEST_TASK_DEF" | jq --arg IMAGE "${{ steps.build-image.outputs.image }}" --arg BRANCH "${{ steps.extract_branch.outputs.branch_name }}" '
+          {
+            family: .family,
+            networkMode: .networkMode,
+            requiresCompatibilities: .requiresCompatibilities,
+            cpu: .cpu,
+            memory: .memory,
+            executionRoleArn: .executionRoleArn,
+            taskRoleArn: .taskRoleArn,
+            containerDefinitions: [
+              .containerDefinitions[0] |
+              .image = $IMAGE |
+              .environment = [
+                {name: "ENVIRONMENT", value: "feature"},
+                {name: "BRANCH_NAME", value: $BRANCH}
+              ]
+            ]
+          }
+        ' > task-definition.json
+
+    - name: Register new task definition
+      id: register-task-def
+      run: |
+        TASK_DEF_ARN=$(aws ecs register-task-definition \
+          --cli-input-json file://task-definition.json \
+          --region ${{ env.AWS_REGION }} \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+        echo "task_def_arn=$TASK_DEF_ARN" >> $GITHUB_OUTPUT
+        echo "Registered task definition: $TASK_DEF_ARN"
+
+    - name: Create ECS service (if it doesn't exist)
+      if: steps.check-service.outputs.exists == 'false'
+      run: |
+        # Get network configuration from main service
+        MAIN_SERVICE=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services fastapi-service \
+          --region ${{ env.AWS_REGION }})
+
+        SUBNETS=$(echo $MAIN_SERVICE | jq -r '.services[0].networkConfiguration.awsvpcConfiguration.subnets | join(",")')
+        SECURITY_GROUPS=$(echo $MAIN_SERVICE | jq -r '.services[0].networkConfiguration.awsvpcConfiguration.securityGroups | join(",")')
+        VPC_ID=$(aws ec2 describe-subnets --subnet-ids $(echo $SUBNETS | cut -d',' -f1) --query 'Subnets[0].VpcId' --output text --region ${{ env.AWS_REGION }})
+
+        # Create target group
+        TG_ARN=$(aws elbv2 create-target-group \
+          --name ${{ steps.extract_branch.outputs.tg_name }} \
+          --protocol HTTP \
+          --port 8000 \
+          --vpc-id $VPC_ID \
+          --target-type ip \
+          --health-check-path /health \
+          --health-check-interval-seconds 30 \
+          --health-check-timeout-seconds 5 \
+          --healthy-threshold-count 2 \
+          --unhealthy-threshold-count 3 \
+          --region ${{ env.AWS_REGION }} \
+          --query 'TargetGroups[0].TargetGroupArn' \
+          --output text)
+
+        echo "Created target group: $TG_ARN"
+
+        # Create the ECS service
+        aws ecs create-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service-name ${{ steps.extract_branch.outputs.service_name }} \
+          --task-definition ${{ steps.register-task-def.outputs.task_def_arn }} \
+          --desired-count 1 \
+          --launch-type FARGATE \
+          --platform-version LATEST \
+          --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=ENABLED}" \
+          --load-balancers "targetGroupArn=$TG_ARN,containerName=${{ env.CONTAINER_NAME }},containerPort=8000" \
+          --region ${{ env.AWS_REGION }}
+
+        echo "Created ECS service: ${{ steps.extract_branch.outputs.service_name }}"
+
+    - name: Update ECS service (if it exists)
+      if: steps.check-service.outputs.exists == 'true'
+      run: |
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ steps.extract_branch.outputs.service_name }} \
+          --task-definition ${{ steps.register-task-def.outputs.task_def_arn }} \
+          --force-new-deployment \
+          --region ${{ env.AWS_REGION }}
+
+        echo "Updated ECS service: ${{ steps.extract_branch.outputs.service_name }}"
+
+    - name: Wait for service to stabilize
+      run: |
+        echo "Waiting for service to stabilize..."
+        aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ steps.extract_branch.outputs.service_name }} \
+          --region ${{ env.AWS_REGION }}
+
+    - name: Get service endpoint
+      id: get-endpoint
+      run: |
+        SERVICE_INFO=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ steps.extract_branch.outputs.service_name }} \
+          --region ${{ env.AWS_REGION }})
+
+        TG_ARN=$(echo $SERVICE_INFO | jq -r '.services[0].loadBalancers[0].targetGroupArn')
+
+        if [ -z "$TG_ARN" ] || [ "$TG_ARN" == "null" ]; then
+          echo "endpoint=No load balancer configured" >> $GITHUB_OUTPUT
+        else
+          LB_ARN=$(aws elbv2 describe-target-groups \
+            --target-group-arns $TG_ARN \
+            --region ${{ env.AWS_REGION }} \
+            --query 'TargetGroups[0].LoadBalancerArns[0]' \
+            --output text)
+
+          LB_DNS=$(aws elbv2 describe-load-balancers \
+            --load-balancer-arns $LB_ARN \
+            --region ${{ env.AWS_REGION }} \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+
+          echo "endpoint=http://$LB_DNS" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Deployment summary
+      run: |
+        echo "### Deployment Successful! :rocket:" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** ${{ steps.extract_branch.outputs.branch_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Service:** ${{ steps.extract_branch.outputs.service_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Image:** ${{ steps.build-image.outputs.image }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Task Definition:** ${{ steps.register-task-def.outputs.task_def_arn }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Endpoint:** ${{ steps.get-endpoint.outputs.endpoint }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "#### API Endpoints" >> $GITHUB_STEP_SUMMARY
+        echo "- Documentation: ${{ steps.get-endpoint.outputs.endpoint }}/docs" >> $GITHUB_STEP_SUMMARY
+        echo "- Health Check: ${{ steps.get-endpoint.outputs.endpoint }}/health" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Note:** The feature branch shares the same ALB as the main service." >> $GITHUB_STEP_SUMMARY
