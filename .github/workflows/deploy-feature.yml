@@ -78,7 +78,9 @@ jobs:
           --output json)
 
         # Extract necessary fields and create new task definition
-        echo "$LATEST_TASK_DEF" | jq --arg IMAGE "${{ steps.build-image.outputs.image }}" --arg BRANCH "${{ steps.extract_branch.outputs.branch_name }}" '
+        echo "$LATEST_TASK_DEF" | jq --arg IMAGE "${{ steps.build-image.outputs.image }}" \
+          --arg BRANCH "${{ steps.extract_branch.outputs.branch_name }}" \
+          --arg SAFE_BRANCH "${{ steps.extract_branch.outputs.safe_branch_name }}" '
           {
             family: .family,
             networkMode: .networkMode,
@@ -92,7 +94,8 @@ jobs:
               .image = $IMAGE |
               .environment = [
                 {name: "ENVIRONMENT", value: "feature"},
-                {name: "BRANCH_NAME", value: $BRANCH}
+                {name: "BRANCH_NAME", value: $BRANCH},
+                {name: "ROOT_PATH", value: ("/" + $SAFE_BRANCH)}
               ] |
               del(.command)
             ]

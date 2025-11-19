@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 app = FastAPI(
     title="Python ECS Fargate API",
     description="A sample FastAPI application deployed on AWS ECS Fargate",
-    version="1.0.0"
+    version="1.0.0",
+    root_path=os.getenv("ROOT_PATH", "")
 )
 
 # Configure CORS
