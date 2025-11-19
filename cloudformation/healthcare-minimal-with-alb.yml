@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Minimal Healthcare App - CI/CD Testing with ALB (Default VPC, No NAT, ~$20-25/month)'
+
+Parameters:
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: Database password (no special chars like / @ " or spaces)
+    MinLength: 8
+    Default: Ekabrahmaa123
+
+  DefaultVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Your default VPC ID
+
+  DefaultSubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First default subnet (select any from your default VPC)
+
+  DefaultSubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second default subnet (different AZ from first)
+
+Resources:
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: healthcare-alb-sg
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref DefaultVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: healthcare-alb-sg
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks security group
+      VpcId: !Ref DefaultVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+          Description: Allow direct access for testing
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS security group
+      VpcId: !Ref DefaultVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: healthcare-alb
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref DefaultSubnetId1
+        - !Ref DefaultSubnetId2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: healthcare-alb
+
+  # Default Target Group
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: healthcare-default-tg
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref DefaultVpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: 200
+      Tags:
+        - Key: Name
+          Value: healthcare-default-tg
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DefaultTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # RDS Database
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: RDS subnet group
+      SubnetIds:
+        - !Ref DefaultSubnetId1
+        - !Ref DefaultSubnetId2
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: healthcare-db
+      Engine: postgres
+      EngineVersion: '15.14'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: healthcareapp
+      MasterUserPassword: !Ref DBPassword
+      DBName: healthcaredb
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+      BackupRetentionPeriod: 1
+      PubliclyAccessible: false
+      DeletionProtection: false
+
+  # ECR Repository
+  ECRRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: healthcare-app
+
+  # CloudWatch Logs
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/healthcare
+      RetentionInDays: 3
+
+  # ECS Cluster
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: healthcare-cluster
+
+  # IAM Roles
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # ECS Task Definition
+  TaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: healthcare-task
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: public.ecr.aws/docker/library/python:3.12-slim
+          PortMappings:
+            - ContainerPort: 8000
+          Environment:
+            - Name: ENV
+              Value: dev
+            - Name: DB_HOST
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_NAME
+              Value: healthcaredb
+            - Name: DB_USER
+              Value: healthcareapp
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: DATABASE_URL
+              Value: !Sub 'postgresql://healthcareapp:${DBPassword}@${Database.Endpoint.Address}:5432/healthcaredb'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+          Command:
+            - sh
+            - -c
+            - python3 -m http.server 8000
+
+  # ECS Service
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Database
+      - ALBListener
+    Properties:
+      ServiceName: healthcare-svc
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDef
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref DefaultSubnetId1
+            - !Ref DefaultSubnetId2
+          SecurityGroups:
+            - !GetAtt ECSSecurityGroup.GroupId
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8000
+          TargetGroupArn: !Ref DefaultTargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: HealthcareCluster
+
+  ServiceName:
+    Value: !GetAtt Service.Name
+    Export:
+      Name: HealthcareService
+
+  ECRUri:
+    Value: !GetAtt ECRRepo.RepositoryUri
+    Export:
+      Name: HealthcareECR
+
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export:
+      Name: HealthcareDB
+
+  LoadBalancerDNS:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: HealthcareALB-DNS
+
+  LoadBalancerArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: HealthcareALB-Arn
+
+  LoadBalancerURL:
+    Description: URL of the Application Load Balancer
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: HealthcareALB-URL
+
+  ALBListenerArn:
+    Description: ARN of the ALB Listener
+    Value: !Ref ALBListener
+    Export:
+      Name: HealthcareALB-Listener-Arn
+
+  VPCId:
+    Description: VPC ID used for the infrastructure
+    Value: !Ref DefaultVpcId
+    Export:
+      Name: HealthcareVPC-Id

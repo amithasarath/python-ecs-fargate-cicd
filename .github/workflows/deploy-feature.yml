@@ -122,6 +122,15 @@ jobs:
         SECURITY_GROUPS=$(echo $MAIN_SERVICE | jq -r '.services[0].networkConfiguration.awsvpcConfiguration.securityGroups | join(",")')
         VPC_ID=$(aws ec2 describe-subnets --subnet-ids $(echo $SUBNETS | cut -d',' -f1) --query 'Subnets[0].VpcId' --output text --region ${{ env.AWS_REGION }})
 
+        # Get the existing ALB listener from CloudFormation stack
+        ALB_LISTENER_ARN=$(aws cloudformation describe-stacks \
+          --stack-name ekabrahmaa-test \
+          --region ${{ env.AWS_REGION }} \
+          --query 'Stacks[0].Outputs[?OutputKey==`ALBListenerArn`].OutputValue' \
+          --output text)
+
+        echo "Using ALB Listener: $ALB_LISTENER_ARN"
+
         # Create target group
         TG_ARN=$(aws elbv2 create-target-group \
           --name ${{ steps.extract_branch.outputs.tg_name }} \
@@ -140,6 +149,17 @@ jobs:
 
         echo "Created target group: $TG_ARN"
 
+        # Create listener rule for this feature branch (path-based routing)
+        RULE_PRIORITY=$((1000 + RANDOM % 9000))
+        aws elbv2 create-rule \
+          --listener-arn $ALB_LISTENER_ARN \
+          --priority $RULE_PRIORITY \
+          --conditions Field=path-pattern,Values="/${{ steps.extract_branch.outputs.safe_branch_name }}*" \
+          --actions Type=forward,TargetGroupArn=$TG_ARN \
+          --region ${{ env.AWS_REGION }}
+
+        echo "Created listener rule with priority $RULE_PRIORITY"
+
         # Create the ECS service
         aws ecs create-service \
           --cluster ${{ env.ECS_CLUSTER }} \
@@ -150,6 +170,7 @@ jobs:
           --platform-version LATEST \
           --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUPS],assignPublicIp=ENABLED}" \
           --load-balancers "targetGroupArn=$TG_ARN,containerName=${{ env.CONTAINER_NAME }},containerPort=8000" \
+          --health-check-grace-period-seconds 60 \
           --region ${{ env.AWS_REGION }}
 
         echo "Created ECS service: ${{ steps.extract_branch.outputs.service_name }}"
@@ -177,30 +198,15 @@ jobs:
     - name: Get service endpoint
       id: get-endpoint
       run: |
-        SERVICE_INFO=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ steps.extract_branch.outputs.service_name }} \
-          --region ${{ env.AWS_REGION }})
+        # Get ALB DNS from CloudFormation stack
+        ALB_DNS=$(aws cloudformation describe-stacks \
+          --stack-name ekabrahmaa-test \
+          --region ${{ env.AWS_REGION }} \
+          --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerDNS`].OutputValue' \
+          --output text)
 
-        TG_ARN=$(echo $SERVICE_INFO | jq -r '.services[0].loadBalancers[0].targetGroupArn')
-
-        if [ -z "$TG_ARN" ] || [ "$TG_ARN" == "null" ]; then
-          echo "endpoint=No load balancer configured" >> $GITHUB_OUTPUT
-        else
-          LB_ARN=$(aws elbv2 describe-target-groups \
-            --target-group-arns $TG_ARN \
-            --region ${{ env.AWS_REGION }} \
-            --query 'TargetGroups[0].LoadBalancerArns[0]' \
-            --output text)
-
-          LB_DNS=$(aws elbv2 describe-load-balancers \
-            --load-balancer-arns $LB_ARN \
-            --region ${{ env.AWS_REGION }} \
-            --query 'LoadBalancers[0].DNSName' \
-            --output text)
-
-          echo "endpoint=http://$LB_DNS" >> $GITHUB_OUTPUT
-        fi
+        echo "endpoint=http://$ALB_DNS/${{ steps.extract_branch.outputs.safe_branch_name }}" >> $GITHUB_OUTPUT
+        echo "alb_url=http://$ALB_DNS" >> $GITHUB_OUTPUT
 
     - name: Deployment summary
       run: |
@@ -210,10 +216,13 @@ jobs:
         echo "**Service:** ${{ steps.extract_branch.outputs.service_name }}" >> $GITHUB_STEP_SUMMARY
         echo "**Image:** ${{ steps.build-image.outputs.image }}" >> $GITHUB_STEP_SUMMARY
         echo "**Task Definition:** ${{ steps.register-task-def.outputs.task_def_arn }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Endpoint:** ${{ steps.get-endpoint.outputs.endpoint }}" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "#### API Endpoints" >> $GITHUB_STEP_SUMMARY
-        echo "- Documentation: ${{ steps.get-endpoint.outputs.endpoint }}/docs" >> $GITHUB_STEP_SUMMARY
-        echo "- Health Check: ${{ steps.get-endpoint.outputs.endpoint }}/health" >> $GITHUB_STEP_SUMMARY
+        echo "#### Application Endpoints" >> $GITHUB_STEP_SUMMARY
+        echo "- **Feature Branch URL:** ${{ steps.get-endpoint.outputs.endpoint }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Health Check:** ${{ steps.get-endpoint.outputs.endpoint }}/health" >> $GITHUB_STEP_SUMMARY
+        echo "- **API Docs:** ${{ steps.get-endpoint.outputs.endpoint }}/docs" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Note:** The feature branch shares the same ALB as the main service." >> $GITHUB_STEP_SUMMARY
+        echo "**Main ALB URL:** ${{ steps.get-endpoint.outputs.alb_url }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Note:** Feature branches use path-based routing on the shared ALB." >> $GITHUB_STEP_SUMMARY
+        echo "Access your feature branch at: \`/<branch-name>/*\`" >> $GITHUB_STEP_SUMMARY
