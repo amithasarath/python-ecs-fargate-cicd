@@ -6,13 +6,13 @@ on:
       - 'feature-*'
 
 env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: fastapi-app
-  ECS_CLUSTER: fastapi-cluster
-  ECS_SERVICE_PREFIX: fastapi-feature
-  CONTAINER_NAME: fastapi-container
-  TASK_DEFINITION_FAMILY: fastapi-task-definition
-  PROJECT_NAME: fastapi-ecs
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: healthcare-app
+  ECS_CLUSTER: healthcare-cluster
+  ECS_SERVICE_PREFIX: healthcare-feature
+  CONTAINER_NAME: simple-app-container
+  TASK_DEFINITION_FAMILY: healthcare-task
+  PROJECT_NAME: healthcare-ecs
 
 jobs:
   deploy:
@@ -115,7 +115,7 @@ jobs:
         # Get network configuration from main service
         MAIN_SERVICE=$(aws ecs describe-services \
           --cluster ${{ env.ECS_CLUSTER }} \
-          --services fastapi-service \
+          --services healthcare-svc \
           --region ${{ env.AWS_REGION }})
 
         SUBNETS=$(echo $MAIN_SERVICE | jq -r '.services[0].networkConfiguration.awsvpcConfiguration.subnets | join(",")')
