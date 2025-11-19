@@ -10,7 +10,7 @@ env:
   ECR_REPOSITORY: healthcare-app
   ECS_CLUSTER: healthcare-cluster
   ECS_SERVICE_PREFIX: healthcare-feature
-  CONTAINER_NAME: simple-app-container
+  CONTAINER_NAME: app
   TASK_DEFINITION_FAMILY: healthcare-task
   PROJECT_NAME: healthcare-ecs
 
