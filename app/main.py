@@ -58,6 +58,12 @@ async def health_check():
         "branch": os.getenv("BRANCH_NAME", "unknown")
     }
 
+@app.get("/cicd")
+async def list_items():
+    """Testing"""
+    return {"items": "HEY, ITS WORKING!"}
+
+
 @app.get("/items")
 async def list_items():
     """List all items"""
